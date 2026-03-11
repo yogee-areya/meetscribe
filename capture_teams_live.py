@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Dual-track live capture + transcription of meetings (Teams/Google Meet).
+Manual dual-track live capture + transcription of meetings.
 
-Track 1: BlackHole 2ch (system audio = what others say)
-Track 2: MacBook Pro Microphone (what you say)
+Track 1: BlackHole 2ch (system audio = others) — with speaker diarization
+Track 2: MacBook Pro Microphone (your voice)
 
-Auto-switches audio output to Multi-Output Device on start,
-and restores to MacBook Pro Speakers on stop.
-
-Outputs a labeled transcript with "Others:" and "You:" prefixes.
+Uses faster-whisper (4x speed) + pyannote-audio (speaker labels).
+Auto-switches audio output on start, restores on stop.
 """
 
 import atexit
@@ -22,18 +20,20 @@ CHUNK_SECONDS = 30
 AUDIO_DIR = Path("chunks")
 TRANSCRIPT_FILE = Path("teams_transcript_live.txt")
 
-# Device indices (from ffmpeg -f avfoundation -list_devices true -i "")
-BLACKHOLE_INDEX = "0"  # BlackHole 2ch - system/meeting audio
-MIC_INDEX = "1"        # MacBook Pro Microphone - your voice
+BLACKHOLE_INDEX = "0"  # BlackHole 2ch
+MIC_INDEX = "1"        # MacBook Pro Microphone
 
 MULTI_OUTPUT_DEVICE = "Multi-Output Device"
 SPEAKERS_DEVICE = "MacBook Pro Speakers"
 
-SILENCE_THRESHOLD = 1000  # bytes - skip chunks smaller than this
+SILENCE_THRESHOLD = 1000
+VOLUME_THRESHOLD = -60.0
+
+WHISPER_MODEL = "small"
+COMPUTE_TYPE = "int8"
 
 
 def switch_audio_output(device_name):
-    """Switch macOS audio output device using SwitchAudioSource."""
     try:
         result = subprocess.run(
             ["SwitchAudioSource", "-s", device_name, "-t", "output"],
@@ -44,16 +44,14 @@ def switch_audio_output(device_name):
         else:
             print(f"  WARNING: Could not switch to {device_name}: {result.stderr.strip()}")
     except FileNotFoundError:
-        print("  WARNING: SwitchAudioSource not found. Install with: brew install switchaudio-osx")
+        print("  WARNING: SwitchAudioSource not found")
 
 
 def restore_speakers():
-    """Restore audio output to speakers on exit."""
     switch_audio_output(SPEAKERS_DEVICE)
 
 
 def record_dual(system_path, mic_path, duration):
-    """Record system audio and mic simultaneously as separate files."""
     cmd_sys = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-f", "avfoundation", "-i", f":{BLACKHOLE_INDEX}",
@@ -72,7 +70,6 @@ def record_dual(system_path, mic_path, duration):
 
 
 def get_volume_db(audio_path):
-    """Get mean volume in dB for an audio file."""
     result = subprocess.run(
         ["ffmpeg", "-i", str(audio_path), "-af", "volumedetect", "-f", "null", "/dev/null"],
         capture_output=True, text=True
@@ -86,47 +83,73 @@ def get_volume_db(audio_path):
     return -91.0
 
 
-def remove_speaker_bleed(mic_path, sys_path, cleaned_path):
-    """Subtract system audio from mic to isolate user's voice."""
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-i", str(mic_path),
-        "-i", str(sys_path),
-        "-filter_complex",
-        "[1]volume=-1[inv];[0][inv]amix=inputs=2:duration=first:weights=1 0.8",
-        "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le",
-        str(cleaned_path),
-    ]
-    subprocess.run(cmd, capture_output=True)
-    return cleaned_path
-
-
 def transcribe_chunk(chunk_path, model):
-    """Transcribe a single audio chunk."""
     if not chunk_path.exists() or chunk_path.stat().st_size < SILENCE_THRESHOLD:
         return ""
-    result = model.transcribe(str(chunk_path), language="en", verbose=False)
-    segments = []
-    for seg in result.get("segments", []):
-        text = seg["text"].strip()
-        if text:
-            segments.append(text)
-    return " ".join(segments)
+    segments, _ = model.transcribe(str(chunk_path), language="en", beam_size=5, vad_filter=True)
+    texts = [seg.text.strip() for seg in segments if seg.text.strip()]
+    return " ".join(texts)
+
+
+def transcribe_with_diarization(chunk_path, whisper_model, diarize_pipeline):
+    """Transcribe with speaker labels."""
+    if not chunk_path.exists() or chunk_path.stat().st_size < SILENCE_THRESHOLD:
+        return []
+
+    segments, _ = whisper_model.transcribe(str(chunk_path), language="en", beam_size=5, vad_filter=True)
+    whisper_segments = [{"start": s.start, "end": s.end, "text": s.text.strip()} for s in segments if s.text.strip()]
+
+    if not whisper_segments:
+        return []
+
+    if diarize_pipeline is not None:
+        try:
+            diarization = diarize_pipeline(str(chunk_path))
+            for ws in whisper_segments:
+                best_speaker, best_overlap = "Speaker", 0
+                for turn, _, speaker in diarization.itertracks(yield_label=True):
+                    overlap = max(0, min(ws["end"], turn.end) - max(ws["start"], turn.start))
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_speaker = speaker
+                ws["speaker"] = best_speaker
+        except Exception as e:
+            print(f"  Diarization error: {e}")
+            for ws in whisper_segments:
+                ws["speaker"] = "Speaker"
+    else:
+        for ws in whisper_segments:
+            ws["speaker"] = "Speaker"
+
+    return [(ws["speaker"], ws["text"]) for ws in whisper_segments]
 
 
 def main():
-    import whisper
+    from faster_whisper import WhisperModel
 
     AUDIO_DIR.mkdir(exist_ok=True)
 
-    # Switch to Multi-Output Device so BlackHole receives system audio
     print("Setting up audio routing...")
     switch_audio_output(MULTI_OUTPUT_DEVICE)
     atexit.register(restore_speakers)
 
-    print("Loading Whisper model (base)...")
-    model = whisper.load_model("base")
-    print("Model loaded.\n")
+    print(f"Loading faster-whisper model ({WHISPER_MODEL})...")
+    whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type=COMPUTE_TYPE)
+    print("Whisper model loaded.")
+
+    diarize_pipeline = None
+    try:
+        from pyannote.audio import Pipeline
+        import torch
+        print("Loading pyannote diarization pipeline...")
+        diarize_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=True)
+        if torch.backends.mps.is_available():
+            diarize_pipeline.to(torch.device("mps"))
+            print("Diarization loaded (MPS/GPU).")
+        else:
+            print("Diarization loaded (CPU).")
+    except Exception as e:
+        print(f"Diarization not available: {e}. Continuing without it.")
 
     session_ts = time.strftime("%Y%m%d_%H%M%S")
     elapsed = 0
@@ -142,13 +165,13 @@ def main():
 
     with open(TRANSCRIPT_FILE, "w") as f:
         f.write(f"Meeting Transcript - {session_ts}\n")
-        f.write(f"System audio: BlackHole 2ch (device :{BLACKHOLE_INDEX})\n")
-        f.write(f"Mic audio: MacBook Pro Microphone (device :{MIC_INDEX})\n")
+        f.write(f"Engine: faster-whisper ({WHISPER_MODEL}) + pyannote diarization\n")
         f.write("=" * 60 + "\n\n")
 
-    print(f"Dual-track recording:")
+    print(f"\nDual-track recording:")
     print(f"  System audio (Others) → BlackHole 2ch (:{BLACKHOLE_INDEX})")
     print(f"  Microphone (You)      → MacBook Pro Mic (:{MIC_INDEX})")
+    print(f"  Engine: faster-whisper ({WHISPER_MODEL}) + pyannote")
     print(f"  Chunk size: {CHUNK_SECONDS}s")
     print(f"  Transcript: {TRANSCRIPT_FILE}")
     print("Press Ctrl+C to stop.\n")
@@ -176,33 +199,26 @@ def main():
         ts_end = time.strftime("%H:%M:%S", time.gmtime(elapsed))
         ts_label = f"[{ts_start} - {ts_end}]"
 
-        # Check volume levels to determine who was speaking
         sys_vol = get_volume_db(sys_path) if sys_path.exists() else -91.0
         mic_vol = get_volume_db(mic_path) if mic_path.exists() else -91.0
 
-        sys_has_audio = sys_vol > -60.0
-        mic_has_audio = mic_vol > -60.0
-
         lines = []
 
-        if sys_has_audio:
-            sys_text = transcribe_chunk(sys_path, model)
-            if sys_text:
-                line = f"{ts_label} Others: {sys_text}"
+        # System audio with speaker diarization
+        if sys_vol > VOLUME_THRESHOLD:
+            diarized = transcribe_with_diarization(sys_path, whisper_model, diarize_pipeline)
+            for speaker, text in diarized:
+                line = f"{ts_label} {speaker}: {text}"
                 lines.append(line)
                 print(line)
 
-        if mic_has_audio:
-            cleaned_path = AUDIO_DIR / f"cleaned_{chunk_num:04d}.wav"
-            remove_speaker_bleed(mic_path, sys_path, cleaned_path)
-            cleaned_vol = get_volume_db(cleaned_path) if cleaned_path.exists() else -91.0
-            if cleaned_vol > -60.0:
-                mic_text = transcribe_chunk(cleaned_path, model)
-                if mic_text:
-                    line = f"{ts_label} You: {mic_text}"
-                    lines.append(line)
-                    print(line)
-            cleaned_path.unlink(missing_ok=True)
+        # Mic — just your voice
+        if mic_vol > VOLUME_THRESHOLD:
+            mic_text = transcribe_chunk(mic_path, whisper_model)
+            if mic_text:
+                line = f"{ts_label} You: {mic_text}"
+                lines.append(line)
+                print(line)
 
         if not lines:
             print(f"  {ts_label} (silence)")
@@ -213,11 +229,9 @@ def main():
             with open(TRANSCRIPT_FILE, "a") as f:
                 f.write("\n".join(lines) + "\n")
 
-        # Clean up chunks
         sys_path.unlink(missing_ok=True)
         mic_path.unlink(missing_ok=True)
 
-    # Restore speakers (also handled by atexit)
     restore_speakers()
     print(f"\nDone. Full transcript saved to: {TRANSCRIPT_FILE}")
 

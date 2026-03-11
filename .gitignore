@@ -4,7 +4,9 @@ chunks/
 transcripts/
 *.wav
 *.log
-*.txt
+*_transcript*.txt
+teams_transcript_live.txt
+capture_log.txt
 __pycache__/
 
 # jira related
