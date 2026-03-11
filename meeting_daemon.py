@@ -230,7 +230,7 @@ def load_models():
         log("Loading pyannote speaker diarization pipeline...")
         diarize_pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token=True,
+            token=True,
         )
         # Use MPS (Apple Silicon GPU) if available, else CPU
         if torch.backends.mps.is_available():

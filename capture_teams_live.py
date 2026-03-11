@@ -142,7 +142,7 @@ def main():
         from pyannote.audio import Pipeline
         import torch
         print("Loading pyannote diarization pipeline...")
-        diarize_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=True)
+        diarize_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=True)
         if torch.backends.mps.is_available():
             diarize_pipeline.to(torch.device("mps"))
             print("Diarization loaded (MPS/GPU).")
