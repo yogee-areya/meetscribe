@@ -1,0 +1,11 @@
+.venv/
+.claude/
+chunks/
+transcripts/
+*.wav
+*.log
+*.txt
+__pycache__/
+
+# jira related
+acli-jira-skill.md
