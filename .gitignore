@@ -9,5 +9,11 @@ teams_transcript_live.txt
 capture_log.txt
 __pycache__/
 
+# compiled binary (build from source)
+sck-audio-capture/sck-audio-capture
+
+# cloned repos
+obs-studio/
+
 # jira related
 acli-jira-skill.md

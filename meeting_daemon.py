@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Meeting transcription daemon.
+MeetScribe — Meeting transcription daemon.
 
 Polls Google Calendar via `gws` CLI. Starts recording 1 min before
 each meeting. Stops when the meeting ends OR when you leave the call
 (detected by sustained silence on system audio).
+
+System audio captured via ScreenCaptureKit (like OBS Studio) — no
+BlackHole or Multi-Output Device needed. Mic captured via ffmpeg.
 
 Uses faster-whisper for 4x speed + pyannote-audio for speaker diarization
 on the system audio track to separate multiple remote speakers.
@@ -14,7 +17,6 @@ Models are loaded only during active recordings to save RAM.
 """
 
 import argparse
-import atexit
 import json
 import re
 import signal
@@ -31,11 +33,24 @@ SILENCE_STREAK_LIMIT = 3    # 3 consecutive silent chunks (90s) = you left
 TRANSCRIPTS_DIR = Path("transcripts")
 CHUNKS_DIR = Path("chunks")
 
-BLACKHOLE_INDEX = "0"       # BlackHole 2ch - system/meeting audio
 MIC_INDEX = "1"             # MacBook Pro Microphone
 
-MULTI_OUTPUT_DEVICE = "Multi-Output Device"
-SPEAKERS_DEVICE = "MacBook Pro Speakers"
+# ScreenCaptureKit audio capture binary
+SCK_BINARY = Path(__file__).parent / "sck-audio-capture" / "sck-audio-capture"
+
+# App bundle IDs for meeting platforms (SCK captures by app)
+MEETING_APPS = {
+    "com.google.Chrome":         "Google Chrome",       # Google Meet, web-based Teams
+    "com.microsoft.teams2":      "Microsoft Teams",     # Teams desktop app
+    "com.microsoft.teams":       "Microsoft Teams",     # Teams older version
+    "us.zoom.xos":               "Zoom",                # Zoom desktop
+    "com.cisco.webexmeetingsapp": "Webex",              # Webex
+    "company.thebrowser.Browser": "Arc",                # Arc browser
+    "org.mozilla.firefox":       "Firefox",
+    "com.apple.Safari":          "Safari",
+    "com.brave.Browser":         "Brave",
+    "com.microsoft.edgemac":     "Microsoft Edge",
+}
 
 SILENCE_THRESHOLD = 1000    # bytes
 VOLUME_THRESHOLD = -60.0    # dB
@@ -49,22 +64,21 @@ def log(msg):
     print(f"[{ts}] {msg}", flush=True)
 
 
-def switch_audio_output(device_name):
+def detect_meeting_app():
+    """Detect which meeting app is running by checking SCK's app list."""
     try:
         result = subprocess.run(
-            ["SwitchAudioSource", "-s", device_name, "-t", "output"],
-            capture_output=True, text=True
+            [str(SCK_BINARY), "--list-apps"],
+            capture_output=True, text=True, timeout=5
         )
-        if result.returncode == 0:
-            log(f"Audio output → {device_name}")
-        else:
-            log(f"WARNING: Could not switch to {device_name}: {result.stderr.strip()}")
-    except FileNotFoundError:
-        log("WARNING: SwitchAudioSource not found")
-
-
-def restore_speakers():
-    switch_audio_output(SPEAKERS_DEVICE)
+        running_apps = result.stdout.strip().splitlines()
+        for line in running_apps:
+            bundle_id = line.split("  —  ")[0].strip() if "  —  " in line else ""
+            if bundle_id in MEETING_APPS:
+                return bundle_id, MEETING_APPS[bundle_id]
+    except Exception as e:
+        log(f"App detection error: {e}")
+    return None, None
 
 
 def sanitize_filename(name):
@@ -129,21 +143,25 @@ def get_volume_db(audio_path):
     return -91.0
 
 
-def record_chunk(sys_path, mic_path, duration):
-    cmd_sys = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-f", "avfoundation", "-i", f":{BLACKHOLE_INDEX}",
-        "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le",
-        "-t", str(duration), str(sys_path),
-    ]
-    cmd_mic = [
+def record_chunk(sys_path, mic_path, duration, app_bundle_id=None):
+    """Record system audio via SCK and mic via ffmpeg in parallel."""
+    # System audio via ScreenCaptureKit
+    sck_cmd = [str(SCK_BINARY)]
+    if app_bundle_id:
+        sck_cmd += ["--app", app_bundle_id]
+    else:
+        sck_cmd += ["--desktop"]
+    sck_cmd += ["-o", str(sys_path), "-t", str(duration)]
+
+    # Mic via ffmpeg
+    mic_cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-f", "avfoundation", "-i", f":{MIC_INDEX}",
         "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le",
         "-t", str(duration), str(mic_path),
     ]
-    proc_sys = subprocess.Popen(cmd_sys, stderr=subprocess.PIPE)
-    proc_mic = subprocess.Popen(cmd_mic, stderr=subprocess.PIPE)
+    proc_sys = subprocess.Popen(sck_cmd, stderr=subprocess.PIPE)
+    proc_mic = subprocess.Popen(mic_cmd, stderr=subprocess.PIPE)
     return proc_sys, proc_mic
 
 
@@ -168,7 +186,6 @@ def transcribe_with_diarization(chunk_path, whisper_model, diarize_pipeline, chu
     if not chunk_path.exists() or chunk_path.stat().st_size < SILENCE_THRESHOLD:
         return []
 
-    # Step 1: Transcribe with faster-whisper
     segments, _ = whisper_model.transcribe(
         str(chunk_path), language="en",
         beam_size=5, vad_filter=True,
@@ -182,12 +199,9 @@ def transcribe_with_diarization(chunk_path, whisper_model, diarize_pipeline, chu
     if not whisper_segments:
         return []
 
-    # Step 2: Diarize if pipeline available
     if diarize_pipeline is not None:
         try:
             diarization = diarize_pipeline(str(chunk_path))
-
-            # Assign speakers to whisper segments based on overlap
             for ws in whisper_segments:
                 best_speaker = "Speaker"
                 best_overlap = 0
@@ -207,11 +221,7 @@ def transcribe_with_diarization(chunk_path, whisper_model, diarize_pipeline, chu
         for ws in whisper_segments:
             ws["speaker"] = "Speaker"
 
-    # Format results
-    results = []
-    for ws in whisper_segments:
-        results.append((ws["speaker"], ws["text"]))
-    return results
+    return [(ws["speaker"], ws["text"]) for ws in whisper_segments]
 
 
 def load_models():
@@ -232,9 +242,7 @@ def load_models():
             "pyannote/speaker-diarization-3.1",
             token=True,
         )
-        # Use MPS (Apple Silicon GPU) if available, else CPU
         if torch.backends.mps.is_available():
-            import torch
             diarize_pipeline.to(torch.device("mps"))
             log("Diarization pipeline loaded (MPS/GPU).")
         else:
@@ -252,24 +260,43 @@ def unload_models():
     log("Models unloaded from memory.")
 
 
+def get_daily_transcript(meeting):
+    """Get the daily transcript file path. Creates header if new day."""
+    date_str = meeting["start"].strftime("%Y-%m-%d")
+    transcript_file = TRANSCRIPTS_DIR / f"{date_str}.txt"
+
+    if not transcript_file.exists():
+        with open(transcript_file, "w") as f:
+            f.write(f"Meeting Transcripts — {date_str}\n")
+            f.write(f"Engine: faster-whisper ({WHISPER_MODEL}) + pyannote diarization\n")
+            f.write("=" * 60 + "\n")
+
+    return transcript_file
+
+
 def record_meeting(meeting):
     """Record and transcribe a single meeting."""
-    meeting_name = sanitize_filename(meeting["summary"])
-    date_str = meeting["start"].strftime("%Y%m%d_%H%M")
-    transcript_file = TRANSCRIPTS_DIR / f"{meeting_name}_{date_str}.txt"
+    transcript_file = get_daily_transcript(meeting)
 
     log(f"▶ Starting recording: {meeting['summary']}")
     log(f"  Scheduled: {meeting['start'].strftime('%H:%M')} - {meeting['end'].strftime('%H:%M')}")
     log(f"  Transcript: {transcript_file}")
 
     whisper_model, diarize_pipeline = load_models()
-    switch_audio_output(MULTI_OUTPUT_DEVICE)
 
-    with open(transcript_file, "w") as f:
-        f.write(f"Meeting: {meeting['summary']}\n")
-        f.write(f"Start: {meeting['start'].strftime('%Y-%m-%d %H:%M')}\n")
-        f.write(f"End: {meeting['end'].strftime('%Y-%m-%d %H:%M')}\n")
-        f.write("=" * 60 + "\n\n")
+    # Detect which meeting app to capture audio from
+    app_bundle_id, app_name = detect_meeting_app()
+    if app_bundle_id:
+        log(f"  Detected meeting app: {app_name} ({app_bundle_id})")
+    else:
+        log("  No known meeting app detected — capturing all desktop audio")
+
+    # Append meeting header to daily file
+    with open(transcript_file, "a") as f:
+        f.write(f"\n\n{'─' * 60}\n")
+        f.write(f"📅 {meeting['summary']}\n")
+        f.write(f"   {meeting['start'].strftime('%H:%M')} - {meeting['end'].strftime('%H:%M')}\n")
+        f.write(f"{'─' * 60}\n\n")
 
     elapsed = 0
     chunk_num = 0
@@ -281,12 +308,19 @@ def record_meeting(meeting):
             log(f"■ Meeting time ended: {meeting['summary']}")
             break
 
+        # Re-detect meeting app every 5 chunks in case user switched apps
+        if chunk_num % 5 == 0 and chunk_num > 0:
+            new_id, new_name = detect_meeting_app()
+            if new_id and new_id != app_bundle_id:
+                app_bundle_id, app_name = new_id, new_name
+                log(f"  Switched to: {app_name} ({app_bundle_id})")
+
         chunk_num += 1
         sys_path = CHUNKS_DIR / f"sys_{chunk_num:04d}.wav"
         mic_path = CHUNKS_DIR / f"mic_{chunk_num:04d}.wav"
         ts_start = time.strftime("%H:%M:%S", time.gmtime(elapsed))
 
-        proc_sys, proc_mic = record_chunk(sys_path, mic_path, CHUNK_SECONDS)
+        proc_sys, proc_mic = record_chunk(sys_path, mic_path, CHUNK_SECONDS, app_bundle_id)
         try:
             proc_sys.wait()
             proc_mic.wait()
@@ -316,10 +350,9 @@ def record_meeting(meeting):
                 lines.append(line)
                 log(line)
 
-        # Transcribe mic audio separately (just your voice, no echo cancellation needed)
+        # Transcribe mic audio separately
         if mic_vol > VOLUME_THRESHOLD:
             mic_segments = transcribe_chunk(mic_path, whisper_model)
-            # Only include if mic has content distinct from system audio
             mic_text = " ".join(t for _, _, t in mic_segments)
             if mic_text:
                 line = f"{ts_label} You: {mic_text}"
@@ -336,25 +369,33 @@ def record_meeting(meeting):
         sys_path.unlink(missing_ok=True)
         mic_path.unlink(missing_ok=True)
 
-        # Detect call hangup
-        if sys_vol <= VOLUME_THRESHOLD:
+        # Detect call hangup — silence on BOTH tracks means you left
+        both_silent = sys_vol <= VOLUME_THRESHOLD and mic_vol <= VOLUME_THRESHOLD
+        if both_silent:
             silent_streak += 1
             if silent_streak >= SILENCE_STREAK_LIMIT:
-                log(f"■ No call audio for {silent_streak * CHUNK_SECONDS}s — you likely left. Stopping.")
+                log(f"■ No audio for {silent_streak * CHUNK_SECONDS}s — you likely left. Stopping.")
                 break
         else:
             silent_streak = 0
 
     del whisper_model, diarize_pipeline
     unload_models()
-    switch_audio_output(SPEAKERS_DEVICE)
     log(f"Transcript saved: {transcript_file}")
     return transcript_file
 
 
-def seconds_until(dt):
-    now = datetime.now(dt.tzinfo)
-    return max(0, (dt - now).total_seconds())
+def sleep_until(target_dt, running_check):
+    """Sleep until target datetime, checking actual time each second.
+    Resilient to system sleep/wake — always checks real clock.
+    """
+    while running_check():
+        now = datetime.now(target_dt.tzinfo)
+        remaining = (target_dt - now).total_seconds()
+        if remaining <= 0:
+            return True
+        time.sleep(min(remaining, 1))
+    return False
 
 
 def main():
@@ -369,7 +410,6 @@ def main():
 
     TRANSCRIPTS_DIR.mkdir(exist_ok=True)
     CHUNKS_DIR.mkdir(exist_ok=True)
-    atexit.register(restore_speakers)
 
     running = True
 
@@ -383,44 +423,46 @@ def main():
 
     log("MeetScribe daemon started.")
     log(f"Engine: faster-whisper ({WHISPER_MODEL}) + pyannote diarization")
+    log(f"System audio: ScreenCaptureKit (no BlackHole needed)")
     log(f"Transcripts → {TRANSCRIPTS_DIR.resolve()}")
 
     recorded_meetings = set()
 
     while running:
+        # Fetch today's meetings
         meetings = get_todays_meetings()
-        now = datetime.now(timezone.utc)
+        now_utc = datetime.now(timezone.utc)
 
+        # Find next unrecorded meeting that hasn't ended
         next_meeting = None
         for m in meetings:
             if m["id"] in recorded_meetings:
                 continue
-            if m["end"].astimezone(timezone.utc) > now:
+            if m["end"].astimezone(timezone.utc) > now_utc:
                 next_meeting = m
                 break
 
         if next_meeting is None:
-            log("No upcoming meetings. Sleeping 15 min...")
-            for _ in range(900):
-                if not running:
-                    break
-                time.sleep(1)
+            log("No upcoming meetings. Checking again in 15 min...")
+            # Use real-clock sleep — wake at exact time, not counting seconds
+            wake_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+            sleep_until(wake_at, lambda: running)
             continue
 
+        # Calculate when to start recording (1 min before meeting)
         record_start = next_meeting["start"] - timedelta(seconds=MEETING_START_BUFFER)
-        wait_seconds = seconds_until(record_start)
+        now_local = datetime.now(next_meeting["start"].tzinfo)
+        wait_seconds = (record_start - now_local).total_seconds()
 
         if wait_seconds > 0:
             log(f"Next: {next_meeting['summary']} at {next_meeting['start'].strftime('%H:%M')}. "
-                f"Sleeping {int(wait_seconds // 60)}m {int(wait_seconds % 60)}s...")
-            for _ in range(int(wait_seconds)):
-                if not running:
-                    break
-                time.sleep(1)
-            if not running:
+                f"Waking at {record_start.strftime('%H:%M:%S')} ({int(wait_seconds // 60)}m {int(wait_seconds % 60)}s)")
+            reached = sleep_until(record_start, lambda: running)
+            if not reached:
                 break
 
-        log(f"Meeting detected: {next_meeting['summary']} "
+        # Time to record
+        log(f"Meeting time: {next_meeting['summary']} "
             f"({next_meeting['start'].strftime('%H:%M')} - {next_meeting['end'].strftime('%H:%M')})")
         recorded_meetings.add(next_meeting["id"])
         record_meeting(next_meeting)
